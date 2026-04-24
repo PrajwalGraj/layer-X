@@ -1,8 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { useWallet } from "@solana/wallet-adapter-react";
-import { Mic, ArrowUp, ExternalLink } from "lucide-react";
-import { createContact, resolveRecipient, isValidSolanaAddress, listContacts, type Contact } from "@/lib/contacts";
+import { useWallet, useConnection } from "@solana/wallet-adapter-react";
+import { PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { Mic, ArrowUp, ExternalLink, MicOff } from "lucide-react";
+import {
+  createContact,
+  resolveRecipient,
+  isValidSolanaAddress,
+  listContacts,
+  type Contact,
+} from "@/lib/contacts";
+import { useSpeechRecognition } from "@/hooks/use-speech-recognition";
 
 type ParsedTx =
   | {
@@ -26,7 +34,13 @@ type FlowState =
   | { phase: "review"; tx: ParsedTx }
   | { phase: "broadcasting"; tx: ParsedTx }
   | { phase: "success"; tx: ParsedTx; hash: string }
-  | { phase: "missing-contact"; tx: Extract<ParsedTx, { kind: "send" }>; walletDraft: string; saving: boolean; error?: string };
+  | {
+      phase: "missing-contact";
+      tx: Extract<ParsedTx, { kind: "send" }>;
+      walletDraft: string;
+      saving: boolean;
+      error?: string;
+    };
 
 type LogEntry =
   | { id: string; type: "user"; text: string }
@@ -40,9 +54,7 @@ const RUPEE_RATES: Record<string, number> = {
 };
 
 function parseCommand(input: string): ParsedTx | null {
-  const send = input
-    .trim()
-    .match(/^send\s+([\d.]+)\s+([a-zA-Z]+)\s+to\s+@?([a-zA-Z0-9_.-]+)$/i);
+  const send = input.trim().match(/^send\s+([\d.]+)\s+([a-zA-Z]+)\s+to\s+@?([a-zA-Z0-9_.-]+)$/i);
   if (send) {
     return {
       kind: "send",
@@ -54,9 +66,7 @@ function parseCommand(input: string): ParsedTx | null {
       recipientSource: "contact",
     };
   }
-  const swap = input
-    .trim()
-    .match(/^swap\s+([\d.]+)\s+([a-zA-Z]+)\s+(?:to|for)\s+([a-zA-Z]+)$/i);
+  const swap = input.trim().match(/^swap\s+([\d.]+)\s+([a-zA-Z]+)\s+(?:to|for)\s+([a-zA-Z]+)$/i);
   if (swap) {
     return {
       kind: "swap",
@@ -88,7 +98,8 @@ function truncateAddress(address: string, chars = 4) {
 }
 
 export function CommandCenter() {
-  const { publicKey, connected } = useWallet();
+  const { connection } = useConnection();
+  const { publicKey, connected, sendTransaction } = useWallet();
   const userId = publicKey?.toBase58() ?? null;
   const [input, setInput] = useState("");
   const [log, setLog] = useState<LogEntry[]>([]);
@@ -102,6 +113,70 @@ export function CommandCenter() {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [loadingContacts, setLoadingContacts] = useState(false);
+
+  // Speech recognition
+  const {
+    transcript,
+    isListening,
+    error: speechError,
+    permissionDenied,
+    browserSupportsSpeech,
+    toggleListening,
+    resetTranscript,
+    requestMicrophonePermission,
+  } = useSpeechRecognition({
+    continuous: true,
+    language: "en-IN", // Switch to Indian English for better Indian name recognition
+    keywords: contacts.map((c) => c.name), // Boost recognition for precise user contacts
+    interimResults: true,
+    onResult: (text, isFinal) => {
+      if (text && text.trim()) {
+        // Clean the text - remove extra spaces and normalize
+        const cleanedText = text.trim();
+
+        // Only update input with final results to avoid duplicates
+        if (isFinal) {
+          setInput((prev) => {
+            // If previous input already ends with this text, don't add it again
+            if (prev.endsWith(cleanedText)) {
+              return prev;
+            }
+
+            // If text is already contained in previous input, replace with new version
+            if (prev.includes(cleanedText) && cleanedText.length > 5) {
+              // Find where the text starts and replace it
+              const startIndex = prev.indexOf(cleanedText);
+              if (startIndex !== -1) {
+                return (
+                  prev.slice(0, startIndex) +
+                  cleanedText +
+                  prev.slice(startIndex + cleanedText.length)
+                );
+              }
+            }
+
+            // Append with space if needed
+            if (!prev) {
+              return cleanedText;
+            }
+
+            // Check if we're continuing the same phrase
+            const wordsPrev = prev.split(" ");
+            const wordsNew = cleanedText.split(" ");
+            const overlap = wordsPrev.slice(-3).join(" ");
+
+            if (cleanedText.startsWith(overlap) && overlap.length > 5) {
+              // Overlap found, remove overlapping part
+              return prev + cleanedText.slice(overlap.length);
+            }
+
+            // Otherwise append with space
+            return prev + (prev.endsWith(" ") ? "" : " ") + cleanedText;
+          });
+        }
+      }
+    },
+  });
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -127,7 +202,7 @@ export function CommandCenter() {
 
   // Filter contacts based on suggestion query
   const filteredContacts = contacts.filter((c) =>
-    c.name.toLowerCase().includes(suggestionQuery.toLowerCase())
+    c.name.toLowerCase().includes(suggestionQuery.toLowerCase()),
   );
 
   // Handle @ mention input detection
@@ -164,9 +239,7 @@ export function CommandCenter() {
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault();
-        setSelectedIndex((prev) =>
-          Math.min(prev + 1, filteredContacts.length - 1)
-        );
+        setSelectedIndex((prev) => Math.min(prev + 1, filteredContacts.length - 1));
         break;
       case "ArrowUp":
         e.preventDefault();
@@ -259,19 +332,55 @@ export function CommandCenter() {
         walletDraft: "",
         saving: false,
       });
-      appendSystem(`No contact found for "${parsed.recipientName}". Add a wallet address to continue.`);
+      appendSystem(
+        `No contact found for "${parsed.recipientName}". Add a wallet address to continue.`,
+      );
     } catch (requestError) {
-      appendSystem(requestError instanceof Error ? requestError.message : "Could not resolve contact.");
+      appendSystem(
+        requestError instanceof Error ? requestError.message : "Could not resolve contact.",
+      );
     }
   }
 
-  function handleConfirm() {
-    if (flow.phase !== "review") return;
+  async function handleConfirm() {
+    if (flow.phase !== "review" || !publicKey) return;
+
     setFlow({ phase: "broadcasting", tx: flow.tx });
-    setTimeout(() => {
-      const hash = randomHash();
-      setFlow({ phase: "success", tx: flow.tx, hash });
-    }, 1400);
+
+    try {
+      if (flow.tx.kind === "send") {
+        if (flow.tx.token !== "SOL") {
+          throw new Error("Only SOL transfers are currently supported directly.");
+        }
+
+        const recipientPubkey = new PublicKey(flow.tx.recipientWallet);
+        const amountLamports = Math.round(flow.tx.amount * LAMPORTS_PER_SOL);
+
+        const transaction = new Transaction().add(
+          SystemProgram.transfer({
+            fromPubkey: publicKey,
+            toPubkey: recipientPubkey,
+            lamports: amountLamports,
+          }),
+        );
+
+        const {
+          context: { slot: minContextSlot },
+          value: { blockhash, lastValidBlockHeight },
+        } = await connection.getLatestBlockhashAndContext();
+
+        const signature = await sendTransaction(transaction, connection, { minContextSlot });
+        await connection.confirmTransaction({ blockhash, lastValidBlockHeight, signature });
+
+        setFlow({ phase: "success", tx: flow.tx, hash: signature });
+      } else {
+        // Mock swap for now if needed, or implement full swap
+        throw new Error("Swaps not implemented yet.");
+      }
+    } catch (error) {
+      appendSystem(`Transaction failed: ${error instanceof Error ? error.message : String(error)}`);
+      setFlow({ phase: "idle" });
+    }
   }
 
   function handleCancel() {
@@ -343,10 +452,7 @@ export function CommandCenter() {
       </header>
 
       {/* Conversation flow */}
-      <div
-        ref={scrollRef}
-        className="flex-1 min-h-0 space-y-8 overflow-y-auto pr-2"
-      >
+      <div ref={scrollRef} className="flex-1 min-h-0 space-y-8 overflow-y-auto pr-2">
         {log.length === 0 && flow.phase === "idle" && (
           <div className="text-sm text-muted-foreground/60">
             Your commands and confirmations will appear here.
@@ -391,6 +497,33 @@ export function CommandCenter() {
       {/* Command bar */}
       <form onSubmit={handleSubmit} className="pt-6">
         <div className="group relative flex items-center rounded-xl bg-surface px-4 py-3 transition-shadow focus-within:glow-primary-sm">
+          {/* Speech recognition status indicators */}
+          {isListening && (
+            <div className="absolute -top-8 left-0 right-0 flex justify-center">
+              <div className="rounded-md bg-primary/10 px-3 py-1 text-xs font-medium text-primary animate-pulse">
+                🎤 Listening... Speak your command
+              </div>
+            </div>
+          )}
+          {speechError && (
+            <div className="absolute -top-8 left-0 right-0 flex justify-center">
+              <div className="rounded-md bg-destructive/10 px-3 py-1 text-xs font-medium text-destructive flex flex-col items-center gap-1">
+                <div className="flex items-center">
+                  <span className="mr-1">⚠️</span>
+                  <span>{speechError}</span>
+                </div>
+                {permissionDenied && (
+                  <button
+                    type="button"
+                    onClick={requestMicrophonePermission}
+                    className="mt-1 rounded bg-destructive/20 px-2 py-0.5 text-xs font-medium text-destructive-foreground hover:bg-destructive/30 transition-colors"
+                  >
+                    Grant Microphone Permission
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
           {/* @ mention suggestions dropdown */}
           {showSuggestions && filteredContacts.length > 0 && (
             <div className="absolute bottom-full left-0 right-0 mb-2 rounded-lg bg-surface border border-border shadow-lg z-20">
@@ -431,10 +564,23 @@ export function CommandCenter() {
           />
           <button
             type="button"
-            aria-label="Voice input"
-            className="ml-2 flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:text-primary"
+            aria-label={isListening ? "Stop listening" : "Start voice input"}
+            onClick={toggleListening}
+            disabled={!browserSupportsSpeech}
+            className={`ml-2 flex h-8 w-8 items-center justify-center rounded-md transition-colors ${
+              isListening
+                ? "bg-destructive text-destructive-foreground animate-pulse"
+                : "text-muted-foreground hover:text-primary"
+            } ${!browserSupportsSpeech ? "opacity-50 cursor-not-allowed" : ""}`}
+            title={
+              !browserSupportsSpeech
+                ? "Speech recognition not supported in your browser"
+                : isListening
+                  ? "Click to stop listening"
+                  : "Click to start voice input"
+            }
           >
-            <Mic className="h-4 w-4" />
+            {isListening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
           </button>
           <button
             type="submit"
@@ -474,9 +620,7 @@ function ReviewBlock({
         </div>
         <div className="font-mono text-2xl font-medium text-foreground">
           {tx.amount} {isSend ? tx.token : tx.from}
-          <span className="ml-2 text-base text-muted-foreground">
-            ({txAmountInr(tx)})
-          </span>
+          <span className="ml-2 text-base text-muted-foreground">({txAmountInr(tx)})</span>
         </div>
       </div>
 
@@ -502,9 +646,7 @@ function ReviewBlock({
 
       <div className="space-y-1 text-xs">
         {isSend && <div className="text-warning">⚠ First time interacting with this address</div>}
-        {tx.amount >= 5 && (
-          <div className="text-warning">⚠ Large amount — please double check</div>
-        )}
+        {tx.amount >= 5 && <div className="text-warning">⚠ Large amount — please double check</div>}
       </div>
 
       <div className="flex items-center gap-3 pt-1">
@@ -534,15 +676,7 @@ function BroadcastingBlock() {
   );
 }
 
-function SuccessBlock({
-  tx,
-  hash,
-  onDone,
-}: {
-  tx: ParsedTx;
-  hash: string;
-  onDone: () => void;
-}) {
+function SuccessBlock({ tx, hash, onDone }: { tx: ParsedTx; hash: string; onDone: () => void }) {
   return (
     <div className="animate-enter animate-success rounded-xl border border-primary/30 bg-surface/50 p-5">
       <div className="text-sm font-medium text-primary">✓ Sent successfully</div>
@@ -556,7 +690,7 @@ function SuccessBlock({
       </div>
       <div className="mt-4 flex items-center gap-4">
         <a
-          href={`https://explorer.solana.com/tx/${hash}`}
+          href={`https://explorer.solana.com/tx/${hash}?cluster=devnet`}
           target="_blank"
           rel="noreferrer"
           className="inline-flex items-center gap-1 text-xs text-primary transition-colors hover:text-primary-glow"
@@ -638,9 +772,7 @@ function MissingContactBlock({
 function Row({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
     <div className="flex items-baseline gap-6">
-      <span className="w-20 text-xs uppercase tracking-wider text-muted-foreground">
-        {label}
-      </span>
+      <span className="w-20 text-xs uppercase tracking-wider text-muted-foreground">{label}</span>
       <span className={`text-foreground ${mono ? "font-mono" : ""}`}>{value}</span>
     </div>
   );
