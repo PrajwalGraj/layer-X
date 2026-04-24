@@ -1,11 +1,16 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import { PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from "@solana/web3.js";
-import { Mic, MicOff, ArrowUp, ExternalLink } from "lucide-react";
-import { createContact, resolveRecipient, isValidSolanaAddress, listContacts, type Contact } from "@/lib/contacts";
-import * as DeepgramSDK from "@deepgram/sdk";
-const { createClient, LiveTranscriptionEvents } = DeepgramSDK;
+import { Mic, ArrowUp, ExternalLink, MicOff } from "lucide-react";
+import {
+  createContact,
+  resolveRecipient,
+  isValidSolanaAddress,
+  listContacts,
+  type Contact,
+} from "@/lib/contacts";
+import { useSpeechRecognition } from "@/hooks/use-speech-recognition";
 
 type ParsedTx =
   | {
@@ -42,43 +47,11 @@ type LogEntry =
   | { id: string; type: "system"; text: string };
 
 const RUPEE_RATES: Record<string, number> = {
-  SOL: 8090.44,
-  USDC: 94.16,
+  SOL: 8000,
+  USDC: 83,
   JUP: 50,
   ETH: 240000,
 };
-
-// Swap rates: how much of token B you get for 1 unit of token A
-const SWAP_RATES: Record<string, Record<string, number>> = {
-  SOL: {
-    USDC: 85.898683,
-    JUP: 1234.5,
-  },
-  USDC: {
-    SOL: 1 / 85.898683,
-    JUP: 14.82,
-  },
-  JUP: {
-    SOL: 1 / 1234.5,
-    USDC: 1 / 14.82,
-  },
-};
-
-function getSwapAmount(fromToken: string, toToken: string, amount: number): number {
-  const rate = SWAP_RATES[fromToken]?.[toToken];
-  if (!rate) {
-    return 0;
-  }
-  return amount * rate;
-}
-
-function normalizeTokenSymbol(symbol: string) {
-  const normalized = symbol.trim().toUpperCase();
-  if (normalized === "SOLANA") {
-    return "SOL";
-  }
-  return normalized;
-}
 
 function parseCommand(input: string): ParsedTx | null {
   const send = input.trim().match(/^send\s+([\d.]+)\s+([a-zA-Z]+)\s+to\s+@?([a-zA-Z0-9_.-]+)$/i);
@@ -86,7 +59,7 @@ function parseCommand(input: string): ParsedTx | null {
     return {
       kind: "send",
       amount: parseFloat(send[1]),
-      token: normalizeTokenSymbol(send[2]),
+      token: send[2].toUpperCase(),
       recipientName: send[3],
       recipientLabel: send[3],
       recipientWallet: "",
@@ -98,8 +71,8 @@ function parseCommand(input: string): ParsedTx | null {
     return {
       kind: "swap",
       amount: parseFloat(swap[1]),
-      from: normalizeTokenSymbol(swap[2]),
-      to: normalizeTokenSymbol(swap[3]),
+      from: swap[2].toUpperCase(),
+      to: swap[3].toUpperCase(),
     };
   }
   return null;
@@ -109,10 +82,18 @@ function inr(n: number) {
   return `₹${n.toLocaleString("en-IN", { maximumFractionDigits: 0 })}`;
 }
 
+function randomHash() {
+  const chars = "abcdef0123456789";
+  let s = "";
+  for (let i = 0; i < 16; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return `0x${s}`;
+}
+
 function truncateAddress(address: string, chars = 4) {
   if (address.length <= chars * 2 + 3) {
     return address;
   }
+
   return `${address.slice(0, chars)}...${address.slice(-chars)}`;
 }
 
@@ -120,11 +101,9 @@ export function CommandCenter() {
   const { connection } = useConnection();
   const { publicKey, connected, sendTransaction } = useWallet();
   const userId = publicKey?.toBase58() ?? null;
-  
   const [input, setInput] = useState("");
   const [log, setLog] = useState<LogEntry[]>([]);
   const [flow, setFlow] = useState<FlowState>({ phase: "idle" });
-  
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -135,129 +114,69 @@ export function CommandCenter() {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [loadingContacts, setLoadingContacts] = useState(false);
 
-  // Deepgram Speech recognition state
-  const [isListening, setIsListening] = useState(false);
-  const [speechError, setSpeechError] = useState<string | null>(null);
-  const [permissionDenied, setPermissionDenied] = useState(false);
-  
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const connectionRef = useRef<any>(null);
+  // Speech recognition
+  const {
+    transcript,
+    isListening,
+    error: speechError,
+    permissionDenied,
+    browserSupportsSpeech,
+    toggleListening,
+    resetTranscript,
+    requestMicrophonePermission,
+  } = useSpeechRecognition({
+    continuous: true,
+    language: "en-IN", // Switch to Indian English for better Indian name recognition
+    keywords: contacts.map((c) => c.name), // Boost recognition for precise user contacts
+    interimResults: true,
+    onResult: (text, isFinal) => {
+      if (text && text.trim()) {
+        // Clean the text - remove extra spaces and normalize
+        const cleanedText = text.trim();
 
-  const stopListening = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    }
-    if (connectionRef.current) {
-      connectionRef.current.finish();
-      connectionRef.current = null;
-    }
-    setIsListening(false);
-  }, []);
+        // Only update input with final results to avoid duplicates
+        if (isFinal) {
+          setInput((prev) => {
+            // If previous input already ends with this text, don't add it again
+            if (prev.endsWith(cleanedText)) {
+              return prev;
+            }
 
-  const toggleListening = async () => {
-    if (isListening) {
-      stopListening();
-      return;
-    }
-
-    setSpeechError(null);
-    setPermissionDenied(false);
-
-    try {
-      // 1. Get Microphone Access
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      
-      // 2. Initialize Deepgram Client
-      // IMPORTANT: Replace this with your actual key or fetch from backend
-      const deepgram = createClient(process.env.NEXT_PUBLIC_DEEPGRAM_API_KEY || "YOUR_DEEPGRAM_API_KEY");
-      
-      const socket = deepgram.listen.live({
-        language: "en-IN",
-        smart_format: true,
-        interim_results: true,
-        keywords: contacts.map((c) => `${c.name}:2`) // Boost recognition for user contacts
-      });
-
-      connectionRef.current = socket;
-
-      socket.on(LiveTranscriptionEvents.Open, () => {
-        setIsListening(true);
-        
-        // 3. Start Recording
-        const mediaRecorder = new MediaRecorder(stream);
-        mediaRecorderRef.current = mediaRecorder;
-
-        mediaRecorder.addEventListener("dataavailable", async (event) => {
-          if (event.data.size > 0 && socket.getReadyState() === 1) {
-            socket.send(event.data);
-          }
-        });
-
-        mediaRecorder.start(250); // Send data every 250ms
-      });
-
-      socket.on(LiveTranscriptionEvents.Transcript, (data) => {
-        const transcript = data.channel.alternatives[0].transcript;
-        const isFinal = data.is_final;
-
-        if (transcript && transcript.trim()) {
-          const cleanedText = transcript.trim();
-
-          if (isFinal) {
-            setInput((prev) => {
-              // Same deduplication logic as original code
-              if (prev.endsWith(cleanedText)) return prev;
-
-              if (prev.includes(cleanedText) && cleanedText.length > 5) {
-                const startIndex = prev.indexOf(cleanedText);
-                if (startIndex !== -1) {
-                  return (
-                    prev.slice(0, startIndex) +
-                    cleanedText +
-                    prev.slice(startIndex + cleanedText.length)
-                  );
-                }
+            // If text is already contained in previous input, replace with new version
+            if (prev.includes(cleanedText) && cleanedText.length > 5) {
+              // Find where the text starts and replace it
+              const startIndex = prev.indexOf(cleanedText);
+              if (startIndex !== -1) {
+                return (
+                  prev.slice(0, startIndex) +
+                  cleanedText +
+                  prev.slice(startIndex + cleanedText.length)
+                );
               }
+            }
 
-              if (!prev) return cleanedText;
+            // Append with space if needed
+            if (!prev) {
+              return cleanedText;
+            }
 
-              const wordsPrev = prev.split(" ");
-              const wordsNew = cleanedText.split(" ");
-              const overlap = wordsPrev.slice(-3).join(" ");
-              
-              if (cleanedText.startsWith(overlap) && overlap.length > 5) {
-                return prev + cleanedText.slice(overlap.length);
-              }
+            // Check if we're continuing the same phrase
+            const wordsPrev = prev.split(" ");
+            const wordsNew = cleanedText.split(" ");
+            const overlap = wordsPrev.slice(-3).join(" ");
 
-              return prev + (prev.endsWith(" ") ? "" : " ") + cleanedText;
-            });
-          }
+            if (cleanedText.startsWith(overlap) && overlap.length > 5) {
+              // Overlap found, remove overlapping part
+              return prev + cleanedText.slice(overlap.length);
+            }
+
+            // Otherwise append with space
+            return prev + (prev.endsWith(" ") ? "" : " ") + cleanedText;
+          });
         }
-      });
-
-      socket.on(LiveTranscriptionEvents.Error, (err) => {
-        setSpeechError("Deepgram Error: " + err.message);
-        stopListening();
-      });
-
-      socket.on(LiveTranscriptionEvents.Close, () => {
-        setIsListening(false);
-      });
-
-    } catch (err) {
-      console.error(err);
-      setPermissionDenied(true);
-      setSpeechError("Microphone permission denied or not available.");
-      setIsListening(false);
-    }
-  };
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      stopListening();
-    };
-  }, [stopListening]);
+      }
+    },
+  });
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -316,6 +235,7 @@ export function CommandCenter() {
   // Handle keyboard navigation in suggestions
   function handleInputKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (!showSuggestions || filteredContacts.length === 0) return;
+
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault();
@@ -344,10 +264,8 @@ export function CommandCenter() {
     e?.preventDefault();
     const text = input.trim();
     if (!text || flow.phase === "broadcasting") return;
-    
     appendUser(text);
     setInput("");
-    
     const parsed = parseCommand(text);
     if (!parsed) {
       appendSystem(
@@ -368,6 +286,7 @@ export function CommandCenter() {
 
     try {
       const resolved = await resolveRecipient(userId, parsed.recipientName);
+
       if (resolved.matchType === "contact") {
         setFlow({
           phase: "review",
@@ -423,14 +342,45 @@ export function CommandCenter() {
     }
   }
 
-  function handleConfirm() {
-    if (flow.phase !== "review") return;
+  async function handleConfirm() {
+    if (flow.phase !== "review" || !publicKey) return;
+
     setFlow({ phase: "broadcasting", tx: flow.tx });
-    setTimeout(() => {
-      // Assuming randomHash() exists in your scope or imports
-      const hash = "random-hash-" + Math.floor(Math.random() * 1000000); 
-      setFlow({ phase: "success", tx: flow.tx, hash });
-    }, 1400);
+
+    try {
+      if (flow.tx.kind === "send") {
+        if (flow.tx.token !== "SOL") {
+          throw new Error("Only SOL transfers are currently supported directly.");
+        }
+
+        const recipientPubkey = new PublicKey(flow.tx.recipientWallet);
+        const amountLamports = Math.round(flow.tx.amount * LAMPORTS_PER_SOL);
+
+        const transaction = new Transaction().add(
+          SystemProgram.transfer({
+            fromPubkey: publicKey,
+            toPubkey: recipientPubkey,
+            lamports: amountLamports,
+          }),
+        );
+
+        const {
+          context: { slot: minContextSlot },
+          value: { blockhash, lastValidBlockHeight },
+        } = await connection.getLatestBlockhashAndContext();
+
+        const signature = await sendTransaction(transaction, connection, { minContextSlot });
+        await connection.confirmTransaction({ blockhash, lastValidBlockHeight, signature });
+
+        setFlow({ phase: "success", tx: flow.tx, hash: signature });
+      } else {
+        // Mock swap for now if needed, or implement full swap
+        throw new Error("Swaps not implemented yet.");
+      }
+    } catch (error) {
+      appendSystem(`Transaction failed: ${error instanceof Error ? error.message : String(error)}`);
+      setFlow({ phase: "idle" });
+    }
   }
 
   function handleCancel() {
@@ -452,11 +402,13 @@ export function CommandCenter() {
     }
 
     setFlow({ ...flow, saving: true, error: undefined });
+
     try {
       const response = await createContact(userId, {
         name: flow.tx.recipientName,
         wallet,
       });
+
       const saved = response.contact;
       if (!saved) {
         throw new Error("Contact could not be saved.");
@@ -563,16 +515,15 @@ export function CommandCenter() {
                 {permissionDenied && (
                   <button
                     type="button"
-                    onClick={toggleListening}
+                    onClick={requestMicrophonePermission}
                     className="mt-1 rounded bg-destructive/20 px-2 py-0.5 text-xs font-medium text-destructive-foreground hover:bg-destructive/30 transition-colors"
                   >
-                    Try Again
+                    Grant Microphone Permission
                   </button>
                 )}
               </div>
             </div>
           )}
-          
           {/* @ mention suggestions dropdown */}
           {showSuggestions && filteredContacts.length > 0 && (
             <div className="absolute bottom-full left-0 right-0 mb-2 rounded-lg bg-surface border border-border shadow-lg z-20">
@@ -615,12 +566,19 @@ export function CommandCenter() {
             type="button"
             aria-label={isListening ? "Stop listening" : "Start voice input"}
             onClick={toggleListening}
+            disabled={!browserSupportsSpeech}
             className={`ml-2 flex h-8 w-8 items-center justify-center rounded-md transition-colors ${
               isListening
                 ? "bg-destructive text-destructive-foreground animate-pulse"
                 : "text-muted-foreground hover:text-primary"
-            }`}
-            title={isListening ? "Click to stop listening" : "Click to start voice input"}
+            } ${!browserSupportsSpeech ? "opacity-50 cursor-not-allowed" : ""}`}
+            title={
+              !browserSupportsSpeech
+                ? "Speech recognition not supported in your browser"
+                : isListening
+                  ? "Click to stop listening"
+                  : "Click to start voice input"
+            }
           >
             {isListening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
           </button>
@@ -655,7 +613,7 @@ function ReviewBlock({
 }) {
   const isSend = tx.kind === "send";
   return (
-    <div className="animate-enter space-y-5 border-l-2 border-border-subtle pl-5 rounded-lg bg-surface/50 p-4">
+    <div className="animate-enter space-y-5 border-l-2 border-border-subtle pl-5">
       <div className="space-y-1">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">
           {isSend ? "You are about to send" : "You are about to swap"}
@@ -679,61 +637,22 @@ function ReviewBlock({
           <>
             <Row label="From" value={tx.from} />
             <Row label="To" value={tx.to} />
-            {(() => {
-              const swapAmount = getSwapAmount(tx.from, tx.to, 1);
-              const receivedAmount = getSwapAmount(tx.from, tx.to, tx.amount);
-              const sentInr = tx.amount * (RUPEE_RATES[tx.from] ?? 100);
-              const receivedInr = receivedAmount * (RUPEE_RATES[tx.to] ?? 100);
-              const lossInr = sentInr - receivedInr;
-              return (
-                <>
-                  <Row
-                    label="Estimated rate"
-                    mono
-                    value={`1 ${tx.from} ≈ ${swapAmount.toFixed(6)} ${tx.to}`}
-                  />
-                  <Row
-                    label="You will get"
-                    mono
-                    value={`${receivedAmount.toFixed(2)} ${tx.to}`}
-                  />
-                  <Row
-                    label="In INR"
-                    mono
-                    value={`₹${receivedInr.toLocaleString("en-IN", { maximumFractionDigits: 2 })}`}
-                  />
-                  <Row
-                    label="You lose"
-                    mono
-                    value={`₹${Math.abs(lossInr).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`}
-                    valueClassName={lossInr > 0 ? "text-red-400" : "text-green-500"}
-                  />
-                </>
-              );
-            })()}
+            <Row label="Estimated rate" mono value={`1 ${tx.from} ≈ 0.012 ${tx.to}`} />
           </>
         )}
         <Row label="Network" value="Solana" />
-        <Row label="Cluster" value="Devnet" />
         <Row label="Fee" mono value="0.000005 SOL" />
       </div>
 
       <div className="space-y-1 text-xs">
         {isSend && <div className="text-warning">⚠ First time interacting with this address</div>}
-        {tx.amount >= 5 && (
-          <div className="text-warning">⚠ Large amount — please double check</div>
-        )}
+        {tx.amount >= 5 && <div className="text-warning">⚠ Large amount — please double check</div>}
       </div>
 
       <div className="flex items-center gap-3 pt-1">
         <button
           onClick={onConfirm}
-          disabled={!isSend}
-          className={`rounded-lg px-5 py-2.5 text-sm font-medium transition-all focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
-            !isSend
-              ? "bg-muted-foreground/30 text-muted-foreground cursor-not-allowed"
-              : "bg-primary text-primary-foreground hover:bg-primary-glow active:scale-[0.98] glow-primary"
-          }`}
+          className="rounded-lg bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground transition-all hover:bg-primary-glow active:scale-[0.98] glow-primary focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
         >
           Confirm Transaction
         </button>
@@ -850,13 +769,11 @@ function MissingContactBlock({
   );
 }
 
-function Row({ label, value, mono, valueClassName }: { label: string; value: string; mono?: boolean; valueClassName?: string }) {
+function Row({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
     <div className="flex items-baseline gap-6">
-      <span className="w-20 text-xs uppercase tracking-wider text-muted-foreground">
-        {label}
-      </span>
-      <span className={`text-foreground ${mono ? "font-mono" : ""} ${valueClassName || ""}`}>{value}</span>
+      <span className="w-20 text-xs uppercase tracking-wider text-muted-foreground">{label}</span>
+      <span className={`text-foreground ${mono ? "font-mono" : ""}`}>{value}</span>
     </div>
   );
 }
