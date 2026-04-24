@@ -203,6 +203,157 @@ async function main() {
         return sendJson(res, 201, { contact: toApiContact(doc as any) });
       }
 
+      // UPDATE CONTACT
+      if (url.pathname.startsWith("/contacts/") && req.method === "PATCH") {
+        const contactId = url.pathname.split("/")[2] ?? "";
+        if (!ObjectId.isValid(contactId)) {
+          return sendError(res, 400, "Invalid contact id");
+        }
+
+        const body = (await readJsonBody(req)) as
+          | { userId?: string; name?: string; wallet?: string }
+          | null;
+        const userId = body?.userId?.trim() ?? "";
+
+        if (!isValidSolanaAddress(userId)) {
+          return sendError(res, 400, "Invalid userId");
+        }
+
+        await ensureUserRecord(userId, users);
+
+        const existing = await contacts.findOne({ _id: new ObjectId(contactId), userId });
+        if (!existing) {
+          return sendError(res, 404, "Contact not found");
+        }
+
+        const nextName = body?.name?.trim();
+        const nextWallet = body?.wallet?.trim();
+        const updates: Partial<ContactDoc> = {};
+
+        if (nextName !== undefined) {
+          if (!nextName) {
+            return sendError(res, 400, "Contact name is required");
+          }
+
+          const normalizedName = normalizeContactName(nextName);
+          const nameConflict = await contacts.findOne({
+            userId,
+            nameNormalized: normalizedName,
+            _id: { $ne: existing._id },
+          });
+          if (nameConflict) {
+            return sendError(res, 409, "Contact name already exists");
+          }
+
+          updates.name = displayContactName(nextName);
+          updates.nameNormalized = normalizedName;
+        }
+
+        if (nextWallet !== undefined) {
+          if (!isValidSolanaAddress(nextWallet)) {
+            return sendError(res, 400, "Invalid Solana wallet address");
+          }
+
+          const normalizedWallet = normalizeSolanaAddress(nextWallet);
+          const walletConflict = await contacts.findOne({
+            userId,
+            walletNormalized: normalizedWallet,
+            _id: { $ne: existing._id },
+          });
+          if (walletConflict) {
+            return sendError(res, 409, "Contact wallet already exists");
+          }
+
+          updates.wallet = normalizedWallet;
+          updates.walletNormalized = normalizedWallet;
+        }
+
+        updates.updatedAt = new Date();
+
+        try {
+          await contacts.updateOne({ _id: existing._id, userId }, { $set: updates });
+        } catch (error) {
+          if (error instanceof MongoServerError && error.code === 11000) {
+            return sendError(res, 409, "Contact already exists", "A contact with this name or wallet already exists.");
+          }
+          throw error;
+        }
+
+        const updated = await contacts.findOne({ _id: existing._id, userId });
+        return sendJson(res, 200, { contact: updated ? toApiContact(updated) : null });
+      }
+
+      // DELETE CONTACT
+      if (url.pathname.startsWith("/contacts/") && req.method === "DELETE") {
+        const contactId = url.pathname.split("/")[2] ?? "";
+        const userId = url.searchParams.get("userId") ?? "";
+
+        if (!ObjectId.isValid(contactId)) {
+          return sendError(res, 400, "Invalid contact id");
+        }
+
+        if (!isValidSolanaAddress(userId)) {
+          return sendError(res, 400, "Invalid userId");
+        }
+
+        await ensureUserRecord(userId, users);
+
+        const result = await contacts.deleteOne({ _id: new ObjectId(contactId), userId });
+        if (result.deletedCount === 0) {
+          return sendError(res, 404, "Contact not found");
+        }
+
+        return sendJson(res, 200, { ok: true });
+      }
+
+      // RESOLVE RECIPIENT
+      if (url.pathname === "/contacts/resolve" && req.method === "GET") {
+        const userId = url.searchParams.get("userId") ?? "";
+        const query = url.searchParams.get("query")?.trim() ?? "";
+
+        if (!isValidSolanaAddress(userId)) {
+          return sendError(res, 400, "Invalid userId");
+        }
+
+        if (!query) {
+          return sendError(res, 400, "Query is required");
+        }
+
+        await ensureUserRecord(userId, users);
+
+        const nameQuery = normalizeContactName(query);
+        const contact = await contacts.findOne({ userId, nameNormalized: nameQuery });
+        if (contact) {
+          return sendJson(res, 200, {
+            matchType: "contact",
+            contact: toApiContact(contact),
+          });
+        }
+
+        const usernameMatch = await users.findOne({ usernameNormalized: nameQuery });
+        if (usernameMatch) {
+          return sendJson(res, 200, {
+            matchType: "username",
+            username: usernameMatch.username ?? query,
+            wallet: usernameMatch.wallet,
+            userId: usernameMatch._id,
+          });
+        }
+
+        if (isValidSolanaAddress(query)) {
+          return sendJson(res, 200, {
+            matchType: "wallet",
+            wallet: normalizeSolanaAddress(query),
+          });
+        }
+
+        return sendJson(res, 404, {
+          matchType: "missing",
+          query,
+          message: `No contact found for ${query}`,
+        });
+      }
+
       return sendError(res, 404, "Route not found");
     } catch (err: any) {
       console.error("[request] failed", {
