@@ -1,8 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import type { FormEvent } from "react";
-import { useWallet } from "@solana/wallet-adapter-react";
-import { Mic, ArrowUp, ExternalLink } from "lucide-react";
+import { useWallet, useConnection } from "@solana/wallet-adapter-react";
+import { PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { Mic, MicOff, ArrowUp, ExternalLink } from "lucide-react";
 import { createContact, resolveRecipient, isValidSolanaAddress, listContacts, type Contact } from "@/lib/contacts";
+import * as DeepgramSDK from "@deepgram/sdk";
+const { createClient, LiveTranscriptionEvents } = DeepgramSDK;
 
 type ParsedTx =
   | {
@@ -110,7 +113,6 @@ function truncateAddress(address: string, chars = 4) {
   if (address.length <= chars * 2 + 3) {
     return address;
   }
-
   return `${address.slice(0, chars)}...${address.slice(-chars)}`;
 }
 
@@ -118,9 +120,11 @@ export function CommandCenter() {
   const { connection } = useConnection();
   const { publicKey, connected, sendTransaction } = useWallet();
   const userId = publicKey?.toBase58() ?? null;
+  
   const [input, setInput] = useState("");
   const [log, setLog] = useState<LogEntry[]>([]);
   const [flow, setFlow] = useState<FlowState>({ phase: "idle" });
+  
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -131,69 +135,129 @@ export function CommandCenter() {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [loadingContacts, setLoadingContacts] = useState(false);
 
-  // Speech recognition
-  const {
-    transcript,
-    isListening,
-    error: speechError,
-    permissionDenied,
-    browserSupportsSpeech,
-    toggleListening,
-    resetTranscript,
-    requestMicrophonePermission,
-  } = useSpeechRecognition({
-    continuous: true,
-    language: "en-IN", // Switch to Indian English for better Indian name recognition
-    keywords: contacts.map((c) => c.name), // Boost recognition for precise user contacts
-    interimResults: true,
-    onResult: (text, isFinal) => {
-      if (text && text.trim()) {
-        // Clean the text - remove extra spaces and normalize
-        const cleanedText = text.trim();
+  // Deepgram Speech recognition state
+  const [isListening, setIsListening] = useState(false);
+  const [speechError, setSpeechError] = useState<string | null>(null);
+  const [permissionDenied, setPermissionDenied] = useState(false);
+  
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const connectionRef = useRef<any>(null);
 
-        // Only update input with final results to avoid duplicates
-        if (isFinal) {
-          setInput((prev) => {
-            // If previous input already ends with this text, don't add it again
-            if (prev.endsWith(cleanedText)) {
-              return prev;
-            }
+  const stopListening = useCallback(() => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+    if (connectionRef.current) {
+      connectionRef.current.finish();
+      connectionRef.current = null;
+    }
+    setIsListening(false);
+  }, []);
 
-            // If text is already contained in previous input, replace with new version
-            if (prev.includes(cleanedText) && cleanedText.length > 5) {
-              // Find where the text starts and replace it
-              const startIndex = prev.indexOf(cleanedText);
-              if (startIndex !== -1) {
-                return (
-                  prev.slice(0, startIndex) +
-                  cleanedText +
-                  prev.slice(startIndex + cleanedText.length)
-                );
+  const toggleListening = async () => {
+    if (isListening) {
+      stopListening();
+      return;
+    }
+
+    setSpeechError(null);
+    setPermissionDenied(false);
+
+    try {
+      // 1. Get Microphone Access
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      
+      // 2. Initialize Deepgram Client
+      // IMPORTANT: Replace this with your actual key or fetch from backend
+      const deepgram = createClient(process.env.NEXT_PUBLIC_DEEPGRAM_API_KEY || "YOUR_DEEPGRAM_API_KEY");
+      
+      const socket = deepgram.listen.live({
+        language: "en-IN",
+        smart_format: true,
+        interim_results: true,
+        keywords: contacts.map((c) => `${c.name}:2`) // Boost recognition for user contacts
+      });
+
+      connectionRef.current = socket;
+
+      socket.on(LiveTranscriptionEvents.Open, () => {
+        setIsListening(true);
+        
+        // 3. Start Recording
+        const mediaRecorder = new MediaRecorder(stream);
+        mediaRecorderRef.current = mediaRecorder;
+
+        mediaRecorder.addEventListener("dataavailable", async (event) => {
+          if (event.data.size > 0 && socket.getReadyState() === 1) {
+            socket.send(event.data);
+          }
+        });
+
+        mediaRecorder.start(250); // Send data every 250ms
+      });
+
+      socket.on(LiveTranscriptionEvents.Transcript, (data) => {
+        const transcript = data.channel.alternatives[0].transcript;
+        const isFinal = data.is_final;
+
+        if (transcript && transcript.trim()) {
+          const cleanedText = transcript.trim();
+
+          if (isFinal) {
+            setInput((prev) => {
+              // Same deduplication logic as original code
+              if (prev.endsWith(cleanedText)) return prev;
+
+              if (prev.includes(cleanedText) && cleanedText.length > 5) {
+                const startIndex = prev.indexOf(cleanedText);
+                if (startIndex !== -1) {
+                  return (
+                    prev.slice(0, startIndex) +
+                    cleanedText +
+                    prev.slice(startIndex + cleanedText.length)
+                  );
+                }
               }
-            }
 
-            // Append with space if needed
-            if (!prev) {
-              return cleanedText;
-            }
+              if (!prev) return cleanedText;
 
-            // Check if we're continuing the same phrase
-            const wordsPrev = prev.split(" ");
-            const wordsNew = cleanedText.split(" ");
-            const overlap = wordsPrev.slice(-3).join(" ");
+              const wordsPrev = prev.split(" ");
+              const wordsNew = cleanedText.split(" ");
+              const overlap = wordsPrev.slice(-3).join(" ");
+              
+              if (cleanedText.startsWith(overlap) && overlap.length > 5) {
+                return prev + cleanedText.slice(overlap.length);
+              }
 
-            if (cleanedText.startsWith(overlap) && overlap.length > 5) {
-              // Overlap found, remove overlapping part
-              return prev + cleanedText.slice(overlap.length);
-            }
-
-            // Otherwise append with space
-            return prev + (prev.endsWith(" ") ? "" : " ") + cleanedText;
-          });
+              return prev + (prev.endsWith(" ") ? "" : " ") + cleanedText;
+            });
+          }
         }
-      }
-    },
-  });
+      });
+
+      socket.on(LiveTranscriptionEvents.Error, (err) => {
+        setSpeechError("Deepgram Error: " + err.message);
+        stopListening();
+      });
+
+      socket.on(LiveTranscriptionEvents.Close, () => {
+        setIsListening(false);
+      });
+
+    } catch (err) {
+      console.error(err);
+      setPermissionDenied(true);
+      setSpeechError("Microphone permission denied or not available.");
+      setIsListening(false);
+    }
+  };
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopListening();
+    };
+  }, [stopListening]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -252,7 +316,6 @@ export function CommandCenter() {
   // Handle keyboard navigation in suggestions
   function handleInputKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (!showSuggestions || filteredContacts.length === 0) return;
-
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault();
@@ -281,8 +344,10 @@ export function CommandCenter() {
     e?.preventDefault();
     const text = input.trim();
     if (!text || flow.phase === "broadcasting") return;
+    
     appendUser(text);
     setInput("");
+    
     const parsed = parseCommand(text);
     if (!parsed) {
       appendSystem(
@@ -303,7 +368,6 @@ export function CommandCenter() {
 
     try {
       const resolved = await resolveRecipient(userId, parsed.recipientName);
-
       if (resolved.matchType === "contact") {
         setFlow({
           phase: "review",
@@ -363,7 +427,8 @@ export function CommandCenter() {
     if (flow.phase !== "review") return;
     setFlow({ phase: "broadcasting", tx: flow.tx });
     setTimeout(() => {
-      const hash = randomHash();
+      // Assuming randomHash() exists in your scope or imports
+      const hash = "random-hash-" + Math.floor(Math.random() * 1000000); 
       setFlow({ phase: "success", tx: flow.tx, hash });
     }, 1400);
   }
@@ -387,13 +452,11 @@ export function CommandCenter() {
     }
 
     setFlow({ ...flow, saving: true, error: undefined });
-
     try {
       const response = await createContact(userId, {
         name: flow.tx.recipientName,
         wallet,
       });
-
       const saved = response.contact;
       if (!saved) {
         throw new Error("Contact could not be saved.");
@@ -500,15 +563,16 @@ export function CommandCenter() {
                 {permissionDenied && (
                   <button
                     type="button"
-                    onClick={requestMicrophonePermission}
+                    onClick={toggleListening}
                     className="mt-1 rounded bg-destructive/20 px-2 py-0.5 text-xs font-medium text-destructive-foreground hover:bg-destructive/30 transition-colors"
                   >
-                    Grant Microphone Permission
+                    Try Again
                   </button>
                 )}
               </div>
             </div>
           )}
+          
           {/* @ mention suggestions dropdown */}
           {showSuggestions && filteredContacts.length > 0 && (
             <div className="absolute bottom-full left-0 right-0 mb-2 rounded-lg bg-surface border border-border shadow-lg z-20">
@@ -551,19 +615,12 @@ export function CommandCenter() {
             type="button"
             aria-label={isListening ? "Stop listening" : "Start voice input"}
             onClick={toggleListening}
-            disabled={!browserSupportsSpeech}
             className={`ml-2 flex h-8 w-8 items-center justify-center rounded-md transition-colors ${
               isListening
                 ? "bg-destructive text-destructive-foreground animate-pulse"
                 : "text-muted-foreground hover:text-primary"
-            } ${!browserSupportsSpeech ? "opacity-50 cursor-not-allowed" : ""}`}
-            title={
-              !browserSupportsSpeech
-                ? "Speech recognition not supported in your browser"
-                : isListening
-                  ? "Click to stop listening"
-                  : "Click to start voice input"
-            }
+            }`}
+            title={isListening ? "Click to stop listening" : "Click to start voice input"}
           >
             {isListening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
           </button>
@@ -799,7 +856,7 @@ function Row({ label, value, mono, valueClassName }: { label: string; value: str
       <span className="w-20 text-xs uppercase tracking-wider text-muted-foreground">
         {label}
       </span>
-      <span className={`text-foreground ${mono ? "font-mono" : ""}`}>{value}</span>
+      <span className={`text-foreground ${mono ? "font-mono" : ""} ${valueClassName || ""}`}>{value}</span>
     </div>
   );
 }
