@@ -10,7 +10,7 @@ Layer X
 
 Instead of navigating confusing wallets, struggling with DeFi tools, copying long wallet addresses, or interpreting raw transaction logs, users can simply type what they want — just like sending a message.
 
-> ` Send 1 SOL to @pooja ` ⚡ → Executed on-chain
+> ` Send 1 SOL to @prajwal ` ⚡ → Executed on-chain
 
 Layer X also enables:
 
@@ -62,14 +62,14 @@ We bridge the gap between **human intent** and **on-chain execution**, making bl
 
 Execute blockchain actions using natural language:
 
-` send 1 SOL to @pooja `  
+` send 1 SOL to @prajwal `  
 ` swap 1 SOL to USDC `
 
 ### 🪙 Token Launch via Command (NEW 🚀)
 
 Create a token directly using a simple command:
 
-` create token PrajwalCoin PRJ 1000000 https://i.postimg.cc/Dw81gGyL/profile-pic-NFT.jpg  `
+` create token PrajwalCoin PRJ 1000000 https://i.postimg.cc/DwGyL/profile-pic.jpg  `
 <br>
 ` create token <TokenName> <Symbol> <Supply> <TokenLogoImgLink>  `
 
@@ -113,7 +113,7 @@ Before signing, users clearly see:
 
 Convert complex blockchain data into simple summaries:
 
-` Instead of:  Instruction logs, accounts...  We show:  → Sent 1 SOL to @pooja  `
+` Instead of:  Instruction logs, accounts...  We show:  → Sent 1 SOL to @prajwal  `
 
 ### ⚠️ Risk Detection Layer
 
