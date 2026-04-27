@@ -124,7 +124,7 @@ export function useSpeechRecognition(
     interimResults = true,
     keywords = [],
     keywordBoost = 10,
-    deepgramModel = "nova-2",
+    deepgramModel = "nova-3",
     smartFormat = true,
     punctuate = true,
     numerals = true,
@@ -151,16 +151,25 @@ export function useSpeechRecognition(
 
   const lastProcessedRef = useRef<string>("");
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Track accumulated string across utterances
   const accumulatedRef = useRef("");
+
+  const clearSilenceTimer = useCallback(() => {
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+  }, []);
 
   const resetTranscript = useCallback(() => {
     setTranscript("");
     setFinalTranscript("");
     lastProcessedRef.current = "";
     accumulatedRef.current = "";
-  }, []);
+    clearSilenceTimer();
+  }, [clearSilenceTimer]);
 
   const requestMicrophonePermission = useCallback(async () => {
     try {
@@ -182,6 +191,13 @@ export function useSpeechRecognition(
 
   const stopListening = useCallback(() => {
     setIsListening(false);
+    clearSilenceTimer();
+
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+    }
+
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       mediaRecorderRef.current.stop();
     }
@@ -198,7 +214,14 @@ export function useSpeechRecognition(
       const normalized = normalizeNumbers(accumulatedRef.current.trim());
       onResult(normalized, true);
     }
-  }, [onResult]);
+  }, [clearSilenceTimer, onResult]);
+
+  const restartSilenceTimer = useCallback(() => {
+    clearSilenceTimer();
+    silenceTimerRef.current = setTimeout(() => {
+      stopListening();
+    }, 6000);
+  }, [clearSilenceTimer, stopListening]);
 
   const startListening = useCallback(async () => {
     setError(null);
@@ -214,7 +237,21 @@ export function useSpeechRecognition(
       const apiUrl = import.meta.env.VITE_CONTACTS_API_URL || "http://localhost:8787";
       const tokenRes = await fetch(`${apiUrl}/speech-token`);
       if (!tokenRes.ok) {
-        throw new Error("Failed to authenticate speech recognition.");
+        let details = "";
+        try {
+          const errorBody = (await tokenRes.json()) as { error?: string; details?: string };
+          details = errorBody.details || errorBody.error || "";
+        } catch {
+          // Ignore JSON parse errors and fall back to status text.
+        }
+
+        const suffix = details
+          ? ` ${details}`
+          : tokenRes.statusText
+            ? ` ${tokenRes.statusText}`
+            : "";
+
+        throw new Error(`Failed to authenticate speech recognition.${suffix}`);
       }
 
       const { key: deepgramToken } = await tokenRes.json();
@@ -257,6 +294,7 @@ export function useSpeechRecognition(
 
       socket.onopen = () => {
         setIsListening(true);
+        restartSilenceTimer();
 
         // Start streaming mic data
         const recorderOptions: MediaRecorderOptions = {
@@ -288,34 +326,45 @@ export function useSpeechRecognition(
 
           if (!transcriptChunk) return;
 
-          // Replace transcript text context
-          const currentViewingText = accumulatedRef.current
-            ? `${accumulatedRef.current} ${transcriptChunk}`
-            : transcriptChunk;
+          restartSilenceTimer();
+
+          // Use the latest chunk directly to avoid repeated phrase accumulation.
+          const currentViewingText = transcriptChunk.trim();
+
+          if (!currentViewingText) return;
+
+          // Keep latest recognized text available for stop/final dispatch.
+          accumulatedRef.current = currentViewingText;
 
           if (interimResults || isFinal) {
             setTranscript(currentViewingText);
           }
 
           if (isFinal) {
-            accumulatedRef.current = currentViewingText;
             setFinalTranscript(currentViewingText);
           }
 
-          if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
-
-          debounceTimerRef.current = setTimeout(() => {
+          if (isFinal) {
+            if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+            debounceTimerRef.current = setTimeout(() => {
+              const normalized = normalizeNumbers(currentViewingText);
+              if (normalized !== lastProcessedRef.current) {
+                if (onResult) onResult(normalized, true);
+                lastProcessedRef.current = normalized;
+              }
+            }, 120);
+          } else {
             const normalized = normalizeNumbers(currentViewingText);
-            if (normalized !== lastProcessedRef.current) {
-              if (onResult) onResult(normalized, isFinal);
-              lastProcessedRef.current = normalized;
+            if (onResult) {
+              onResult(normalized, false);
             }
-          }, 300);
+          }
         }
       };
 
       socket.onclose = () => {
         setIsListening(false);
+        clearSilenceTimer();
         stream.getTracks().forEach((track) => track.stop());
       };
 
@@ -346,6 +395,7 @@ export function useSpeechRecognition(
     requestMicrophonePermission,
     resetTranscript,
     smartFormat,
+    restartSilenceTimer,
     stopListening,
     utteranceEndMs,
     vadEvents,
@@ -357,6 +407,15 @@ export function useSpeechRecognition(
     if (isListening) stopListening();
     else await startListening();
   }, [isListening, startListening, stopListening]);
+
+  useEffect(() => {
+    return () => {
+      clearSilenceTimer();
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
+    };
+  }, [clearSilenceTimer]);
 
   return {
     transcript,
