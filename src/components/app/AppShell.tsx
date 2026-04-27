@@ -26,8 +26,8 @@ export function AppShell({ children }: { children?: React.ReactNode }) {
       <aside className="hidden w-55 shrink-0 flex-col bg-sidebar md:flex">
         <div className="px-6 pt-6 pb-10">
           <Link to="/" className="flex items-center gap-2">
-            <span className="inline-block h-2 w-2 rounded-full bg-primary glow-primary-sm" />
-            <span className="font-mono text-sm font-medium tracking-tight">layer-x</span>
+            <img src="/logo.png" alt="Layer-X" className="h-7 w-7 rounded object-contain" />
+            <span className="font-display text-sm font-bold tracking-[0.15em] uppercase">Layer-<span className="text-primary">X</span></span>
           </Link>
         </div>
 

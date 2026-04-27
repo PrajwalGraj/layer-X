@@ -61,6 +61,7 @@
 
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Geist Mono", "JetBrains Mono", ui-monospace, monospace;
+  --font-display: "Orbitron", ui-sans-serif, system-ui, sans-serif;
 
   --shadow-glow-sm: 0 0 0 1px color-mix(in oklab, var(--primary) 35%, transparent),
     0 0 12px -2px color-mix(in oklab, var(--primary) 35%, transparent);
@@ -188,6 +189,10 @@
     font-family: var(--font-mono);
   }
 
+  .font-display {
+    font-family: var(--font-display);
+  }
+
   .glow-primary {
     box-shadow: var(--shadow-glow);
   }
@@ -234,5 +239,76 @@
   }
   .animate-success {
     animation: success-pulse 1.4s ease-out 1;
+  }
+
+  /* Slow ambient float for hero preview card */
+  @keyframes float-slow {
+    0%,
+    100% {
+      transform: translateY(0);
+    }
+    50% {
+      transform: translateY(-8px);
+    }
+  }
+  .animate-float-slow {
+    animation: float-slow 9s ease-in-out infinite;
+  }
+
+  /* Subtle breathing glow for premium card emphasis */
+  @keyframes glow-breathe {
+    0%,
+    100% {
+      box-shadow: var(--shadow-glow-sm);
+    }
+    50% {
+      box-shadow: var(--shadow-glow);
+    }
+  }
+  .glow-breathe {
+    animation: glow-breathe 3.2s ease-in-out infinite;
+  }
+
+  /* Terminal-like caret blink */
+  @keyframes caret-blink {
+    0%,
+    48% {
+      opacity: 1;
+    }
+    52%,
+    100% {
+      opacity: 0;
+    }
+  }
+  .animate-caret-blink {
+    animation: caret-blink 1s steps(1, end) infinite;
+  }
+
+  /* Slower ping for ambient brand pulse */
+  @keyframes ping-slow {
+    0% {
+      transform: scale(1);
+      opacity: 0.45;
+    }
+    75%,
+    100% {
+      transform: scale(1.7);
+      opacity: 0;
+    }
+  }
+  .animate-ping-slow {
+    animation: ping-slow 2.4s cubic-bezier(0, 0, 0.2, 1) infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .animate-float-slow,
+    .glow-breathe,
+    .animate-caret-blink,
+    .animate-ping-slow,
+    .animate-pulse-dot,
+    .animate-enter,
+    .animate-success {
+      animation: none !important;
+    }
   }
 }
