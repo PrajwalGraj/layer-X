@@ -428,12 +428,22 @@ async function main() {
       if (url.pathname === "/speech-token" && req.method === "GET") {
         const deepgramApiKey = process.env.DEEPGRAM_API_KEY;
         const deepgramProjectId = process.env.DEEPGRAM_PROJECT_ID;
+        const allowDirectKeyFallback =
+          process.env.DEEPGRAM_ALLOW_DIRECT_KEY_FALLBACK === "true" ||
+          process.env.NODE_ENV !== "production";
 
         if (!deepgramApiKey) {
           return sendError(res, 500, "Deepgram API key not configured");
         }
 
         if (!deepgramProjectId) {
+          if (allowDirectKeyFallback) {
+            console.warn(
+              "[deepgram] DEEPGRAM_PROJECT_ID missing; using direct API key fallback for speech token",
+            );
+            return sendJson(res, 200, { key: deepgramApiKey });
+          }
+
           return sendError(res, 500, "Deepgram project ID not configured");
         }
 
@@ -456,7 +466,20 @@ async function main() {
           return sendJson(res, 200, { key: result.key });
         } catch (err: unknown) {
           console.error("Deepgram key generation exception:", err);
+
           const message = err instanceof Error ? err.message : String(err);
+          const needsKeysWriteScope =
+            message.includes("INSUFFICIENT_PERMISSIONS") ||
+            message.includes("keys:write") ||
+            message.includes("Status code: 403");
+
+          if (allowDirectKeyFallback && needsKeysWriteScope) {
+            console.warn(
+              "[deepgram] Missing keys:write scope; using direct API key fallback for speech token",
+            );
+            return sendJson(res, 200, { key: deepgramApiKey });
+          }
+
           return sendError(
             res,
             500,
