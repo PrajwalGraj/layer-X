@@ -209,10 +209,13 @@ export function useSpeechRecognition(
       }, 500);
     }
 
-    // Dispatch final update
+    // Dispatch final update (dedupe to avoid duplicate command execution)
     if (accumulatedRef.current && onResult) {
       const normalized = normalizeNumbers(accumulatedRef.current.trim());
-      onResult(normalized, true);
+      if (normalized && normalized !== lastProcessedRef.current) {
+        lastProcessedRef.current = normalized;
+        onResult(normalized, true);
+      }
     }
   }, [clearSilenceTimer, onResult]);
 

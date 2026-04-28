@@ -287,11 +287,21 @@ export function CommandCenter() {
         return;
       }
 
-      // Global shortcut: Shift+Space toggles speech start/stop.
-      // This is allowed even when command input is focused so voice can be toggled quickly.
+      // Shift+Space toggles speech start/stop, but only when in command input or not in an editable element.
+      // This prevents overriding browser's default Shift+Space (page scroll up) in other contexts.
       if (event.shiftKey && event.code === "Space") {
-        event.preventDefault();
-        void toggleListening();
+        const target = event.target as HTMLElement;
+        const isEditableElement =
+          target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.contentEditable === "true";
+        const isCommandInput = target === inputRef.current;
+
+        // Only handle if in the command input or not in any editable element
+        if (isCommandInput || !isEditableElement) {
+          event.preventDefault();
+          void toggleListening();
+        }
       }
     };
 

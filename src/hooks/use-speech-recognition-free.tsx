@@ -1,5 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { pipeline } from "@xenova/transformers";
+
+// Dynamic import to avoid hard dependency on @xenova/transformers
+// This hook is currently unused; uncomment and add @xenova/transformers to package.json when needed
+// import { pipeline } from "@xenova/transformers";
 
 interface UseSpeechRecognitionOptions {
   language?: string;
@@ -120,8 +123,11 @@ export function useSpeechRecognitionFree(
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
   const pipelineRef = useRef<ReturnType<typeof pipeline> | null>(null);
   const accumulatedRef = useRef("");
+  const isTranscribingRef = useRef(false);
+  const queuedAudioBlobRef = useRef<Blob | null>(null);
 
   const resetTranscript = useCallback(() => {
     setTranscript("");
@@ -148,12 +154,32 @@ export function useSpeechRecognitionFree(
 
   const stopListening = useCallback(() => {
     setIsListening(false);
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      mediaRecorderRef.current.stop();
+    
+    // Stop MediaRecorder
+    const mediaRecorder = mediaRecorderRef.current;
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+      mediaRecorder.stop();
     }
+    
+    // Close AudioContext
     if (audioContextRef.current) {
       audioContextRef.current.close();
+      audioContextRef.current = null;
     }
+    
+    // Stop MediaStream tracks (IMPORTANT: prevents microphone from staying active)
+    const stream = mediaStreamRef.current;
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+    
+    // Clean up MediaRecorder ref
+    mediaRecorderRef.current = null;
+
+// Reset transcription state
+    isTranscribingRef.current = false;
+    queuedAudioBlobRef.current = null;
 
     // Dispatch final update
     if (accumulatedRef.current && onResult) {
@@ -166,6 +192,10 @@ export function useSpeechRecognitionFree(
     setError(null);
     resetTranscript();
 
+    // Reset transcription state
+    isTranscribingRef.current = false;
+    queuedAudioBlobRef.current = null;
+
     if (!isMicrophoneAvailable) {
       const granted = await requestMicrophonePermission();
       if (!granted) return;
@@ -175,10 +205,13 @@ export function useSpeechRecognitionFree(
       // Load Whisper pipeline (first time loads model, subsequent calls use cache)
       if (!pipelineRef.current) {
         setTranscript("Loading speech model...");
+        // Dynamically import to avoid hard dependency
+        const { pipeline } = await import("@xenova/transformers");
         pipelineRef.current = await pipeline("automatic-speech-recognition", "Xenova/whisper-tiny.en");
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
       const audioContext = new AudioContext();
       audioContextRef.current = audioContext;
       const sourceNode = audioContext.createMediaStreamSource(stream);
@@ -193,33 +226,56 @@ export function useSpeechRecognitionFree(
       const mediaRecorder = new MediaRecorder(stream);
       mediaRecorderRef.current = mediaRecorder;
 
-      mediaRecorder.addEventListener("dataavailable", async (event) => {
+      // Serialize transcriptions to prevent overlapping calls
+      const transcribeAudioBlob = async (audioBlob: Blob) => {
+        if (isTranscribingRef.current) {
+          queuedAudioBlobRef.current = audioBlob;
+          return;
+        }
+
+        isTranscribingRef.current = true;
+        try {
+          let nextBlob: Blob | null = audioBlob;
+          while (nextBlob) {
+            const currentBlob = nextBlob;
+            queuedAudioBlobRef.current = null;
+            const arrayBuffer = await currentBlob.arrayBuffer();
+
+            try {
+              const result = await pipelineRef.current!(arrayBuffer);
+              const text = result.text || "";
+
+              if (text) {
+                accumulatedRef.current = text;
+
+                if (interimResults) {
+                  setTranscript(text);
+                }
+
+                if (onResult) {
+                  const normalized = normalizeNumbers(text);
+                  onResult(normalized, false);
+                }
+              }
+            } catch (err) {
+              console.error("Transcription error:", err);
+            }
+
+            nextBlob = queuedAudioBlobRef.current;
+          }
+        } finally {
+          isTranscribingRef.current = false;
+        }
+      };
+
+      mediaRecorder.addEventListener("dataavailable", (event) => {
         chunks.push(event.data);
 
-        // Transcribe every ~3 seconds of accumulated audio
-        if (chunks.length % 6 === 0) {
-          const audioBlob = new Blob(chunks, { type: "audio/webm" });
-          const arrayBuffer = await audioBlob.arrayBuffer();
-
-          try {
-            const result = await pipelineRef.current!(arrayBuffer);
-            const text = result.text || "";
-            
-            if (text) {
-              accumulatedRef.current = text;
-              
-              if (interimResults) {
-                setTranscript(text);
-              }
-
-              if (onResult) {
-                const normalized = normalizeNumbers(text);
-                onResult(normalized, false);
-              }
-            }
-          } catch (err) {
-            console.error("Transcription error:", err);
-          }
+        // Transcribe every ~3 seconds of accumulated audio, then clear chunks to avoid O(n²) cost
+        if (chunks.length >= 6) {
+          const windowChunks = chunks.splice(0, chunks.length);
+          const audioBlob = new Blob(windowChunks, { type: "audio/webm" });
+          void transcribeAudioBlob(audioBlob);
         }
       });
 
@@ -256,6 +312,16 @@ export function useSpeechRecognitionFree(
       setError(message);
       if (onError) onError(message);
       setIsListening(false);
+      
+      // Update permission/availability state based on error type
+      if (err instanceof DOMException) {
+        if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+          setPermissionDenied(true);
+          setIsMicrophoneAvailable(false);
+        } else if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
+          setIsMicrophoneAvailable(false);
+        }
+      }
     }
   }, [isMicrophoneAvailable, requestMicrophonePermission, interimResults, onResult, onError, resetTranscript]);
 
