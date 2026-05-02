@@ -239,30 +239,29 @@ export function CommandCenter() {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [loadingContacts, setLoadingContacts] = useState(false);
 
-  // Speech recognition
+  // Speech recognition (using Nova-3 with $200 free trial)
   const {
     transcript,
     isListening,
     error: speechError,
     permissionDenied,
     browserSupportsSpeech,
+    stopListening,
     toggleListening,
     resetTranscript,
     requestMicrophonePermission,
   } = useSpeechRecognition({
     continuous: true,
-    language: "en-IN", // Switch to Indian English for better Indian name recognition
+    language: "en-US",
     keywords: contacts.map((c) => c.name), // Boost recognition for precise user contacts
-    interimResults: true,
-    deepgramModel: "nova-2",
+    deepgramModel: "nova-3",
     keywordBoost: 20,
+    interimResults: true,
+    smartFormat: true,
+    punctuate: true,
+    numerals: true,
     endpointingMs: 400,
     utteranceEndMs: 1000,
-    punctuate: false,
-    numerals: true,
-    smartFormat: true,
-    vadEvents: true,
-    chunkMs: 200,
     onResult: (text, isFinal) => {
       if (text && text.trim()) {
         // Clean the text - remove extra spaces and normalize
@@ -271,47 +270,34 @@ export function CommandCenter() {
 
         // Only update input with final results to avoid duplicates
         if (isFinal) {
-          setInput((prev) => {
-            // If previous input already ends with this text, don't add it again
-            if (prev.endsWith(canonicalText)) {
-              return prev;
-            }
-
-            // If text is already contained in previous input, replace with new version
-            if (prev.includes(canonicalText) && canonicalText.length > 5) {
-              // Find where the text starts and replace it
-              const startIndex = prev.indexOf(canonicalText);
-              if (startIndex !== -1) {
-                return (
-                  prev.slice(0, startIndex) +
-                  canonicalText +
-                  prev.slice(startIndex + canonicalText.length)
-                );
-              }
-            }
-
-            // Append with space if needed
-            if (!prev) {
-              return canonicalText;
-            }
-
-            // Check if we're continuing the same phrase
-            const wordsPrev = prev.split(" ");
-            const wordsNew = canonicalText.split(" ");
-            const overlap = wordsPrev.slice(-3).join(" ");
-
-            if (canonicalText.startsWith(overlap) && overlap.length > 5) {
-              // Overlap found, remove overlapping part
-              return prev + canonicalText.slice(overlap.length);
-            }
-
-            // Otherwise append with space
-            return prev + (prev.endsWith(" ") ? "" : " ") + canonicalText;
-          });
+          setInput(canonicalText);
         }
       }
     },
   });
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!browserSupportsSpeech) return;
+
+      // Escape always stops active speech listening.
+      if (event.key === "Escape" && isListening) {
+        event.preventDefault();
+        stopListening();
+        return;
+      }
+
+      // Global shortcut: Shift+Space toggles speech start/stop.
+      // This is allowed even when command input is focused so voice can be toggled quickly.
+      if (event.shiftKey && event.code === "Space") {
+        event.preventDefault();
+        void toggleListening();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [browserSupportsSpeech, isListening, stopListening, toggleListening]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -754,8 +740,8 @@ export function CommandCenter() {
               !browserSupportsSpeech
                 ? "Speech recognition not supported in your browser"
                 : isListening
-                  ? "Click to stop listening"
-                  : "Click to start voice input"
+                  ? "Click to stop listening (Shift+Space, Esc to cancel)"
+                  : "Click to start voice input (Shift+Space)"
             }
           >
             {isListening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}

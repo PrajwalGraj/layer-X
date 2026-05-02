@@ -424,6 +424,71 @@ async function main() {
         });
       }
 
+      // DEEPGRAM TOKEN
+      if (url.pathname === "/speech-token" && req.method === "GET") {
+        const deepgramApiKey = process.env.DEEPGRAM_API_KEY;
+        const deepgramProjectId = process.env.DEEPGRAM_PROJECT_ID;
+        const allowDirectKeyFallback =
+          process.env.DEEPGRAM_ALLOW_DIRECT_KEY_FALLBACK === "true" ||
+          process.env.NODE_ENV !== "production";
+
+        if (!deepgramApiKey) {
+          return sendError(res, 500, "Deepgram API key not configured");
+        }
+
+        if (!deepgramProjectId) {
+          if (allowDirectKeyFallback) {
+            console.warn(
+              "[deepgram] DEEPGRAM_PROJECT_ID missing; using direct API key fallback for speech token",
+            );
+            return sendJson(res, 200, { key: deepgramApiKey });
+          }
+
+          return sendError(res, 500, "Deepgram project ID not configured");
+        }
+
+        try {
+          const deepgram = new DeepgramClient({ apiKey: deepgramApiKey });
+          // Create a temporary key valid for 10 minutes
+          const result = (await deepgram.manage.v1.projects.keys.create(
+            deepgramProjectId,
+            {
+              comment: "Temporary speech recognition token",
+              scopes: ["usage:write"],
+              time_to_live_in_seconds: 600,
+            } as unknown,
+          )) as unknown as { key: string };
+
+          if (!result.key) {
+            throw new Error("Missing key in response");
+          }
+
+          return sendJson(res, 200, { key: result.key });
+        } catch (err: unknown) {
+          console.error("Deepgram key generation exception:", err);
+
+          const message = err instanceof Error ? err.message : String(err);
+          const needsKeysWriteScope =
+            message.includes("INSUFFICIENT_PERMISSIONS") ||
+            message.includes("keys:write") ||
+            message.includes("Status code: 403");
+
+          if (allowDirectKeyFallback && needsKeysWriteScope) {
+            console.warn(
+              "[deepgram] Missing keys:write scope; using direct API key fallback for speech token",
+            );
+            return sendJson(res, 200, { key: deepgramApiKey });
+          }
+
+          return sendError(
+            res,
+            500,
+            "Failed to generate speech token",
+            message,
+          );
+        }
+      }
+
       if (!isMongoConfigured()) {
         console.error("[mongo] request rejected because MONGODB_URI is missing at runtime");
         return sendError(res, 503, "MongoDB not configured", "Missing MONGODB_URI");
@@ -592,40 +657,6 @@ async function main() {
 
         const updated = await contacts.findOne({ _id: existing._id, userId });
         return sendJson(res, 200, { contact: updated ? toApiContact(updated) : null });
-      }
-
-      // DEEPGRAM TOKEN
-      if (url.pathname === "/speech-token" && req.method === "GET") {
-        if (!process.env.DEEPGRAM_API_KEY) {
-          return sendError(res, 500, "Deepgram API key not configured");
-        }
-
-        try {
-          const deepgram = new DeepgramClient({ apiKey: process.env.DEEPGRAM_API_KEY });
-          // Create a temporary key valid for 10 minutes
-          const result = (await deepgram.manage.v1.projects.keys.create(
-            process.env.DEEPGRAM_PROJECT_ID!,
-            {
-              comment: "Temporary speech recognition token",
-              scopes: ["usage:write"],
-              time_to_live_in_seconds: 600,
-            } as unknown,
-          )) as unknown as { key: string };
-
-          if (!result.key) {
-            throw new Error("Missing key in response");
-          }
-
-          return sendJson(res, 200, { key: result.key });
-        } catch (err: unknown) {
-          console.error("Deepgram key generation exception:", err);
-          return sendError(
-            res,
-            500,
-            "Failed to generate speech token",
-            err instanceof Error ? err.message : String(err),
-          );
-        }
       }
 
       // JUPITER QUOTE PROXY
